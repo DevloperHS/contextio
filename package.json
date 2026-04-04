@@ -1,0 +1,29 @@
+{
+  "name": "hyda_db_bot",
+  "version": "1.0.0",
+  "description": "Telegram Group AI Bot scaffold",
+  "main": "bot/index.js",
+  "scripts": {
+    "dev": "node bot/index.js",
+    "bot": "node bot/index.js",
+    "seed": "node bot/seed.js",
+    "seed:dry": "node -e \"process.env.SEED_DRY_RUN='1'; require('./bot/seed').seedHistory().catch((e)=>{console.error(e.stack||e.message); process.exit(1);})\"",
+    "seed:list-groups": "node scripts/seed-list-groups.js",
+    "dashboard": "node dashboard/index.js",
+    "phase1:test": "node scripts/phase1-test.js",
+    "phase2:test": "node scripts/phase2-test.js",
+    "lint": "echo \"Lint not configured yet\"",
+    "test": "echo \"Tests not configured yet\""
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@hydra_db/node": "^0.1.1",
+    "better-sqlite3": "^12.8.0",
+    "dotenv": "^17.4.0",
+    "grammy": "^1.42.0",
+    "input": "^1.0.1",
+    "telegram": "^2.26.22"
+  }
+}
