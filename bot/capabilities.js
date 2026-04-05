@@ -6,6 +6,8 @@ const PROMPT_TEMPLATES = [
   "@bot extract action items from recent context",
   "@bot what changed about {topic} this week",
   "@bot give a bullet summary of recent discussion on {topic}",
+  "@bot pin the latest summary",
+  "@bot schedule a reminder for tomorrow 10am: share release notes",
 ];
 
 function buildCapabilitiesReply() {
@@ -15,6 +17,14 @@ function buildCapabilitiesReply() {
     "- List discussed issues, concerns, and action items.",
     "- Compare what changed over recent discussion.",
     "- Extract key facts mentioned by participants.",
+    "- Propose safe actions with confirmation (/confirm yes).",
+    "",
+    "Useful commands:",
+    "- /help or /examples",
+    "- /issues",
+    "- /actions",
+    "- /status",
+    "- /followup <question>",
     "",
     "Prompt examples:",
     ...PROMPT_TEMPLATES.map((item) => `- ${item}`),
@@ -26,8 +36,11 @@ function buildCapabilitiesSeedText(groupName) {
   return [
     `SYSTEM: Bot capability guide for ${label}.`,
     "The bot can recall context from seeded and live messages, summarize discussions, list issues, extract action items, and answer targeted questions.",
+    "The bot also supports safe action proposals with explicit confirmation.",
     "Prompt templates:",
     ...PROMPT_TEMPLATES.map((item) => `- ${item}`),
+    "Commands:",
+    "- /help /examples /issues /actions /status /followup <question> /confirm yes",
   ].join("\n");
 }
 
@@ -56,4 +69,3 @@ module.exports = {
   isCapabilitiesQuestion,
   buildCapabilitiesSourceId,
 };
-

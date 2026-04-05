@@ -13,11 +13,37 @@ Output:
 - Persistent logs in SQLite (`messages` table)
 - Optional dashboard view of logs and stats
 
-Core flow:
+## Core architecture
+
+### Baseline flow (backward compatible)
 1. Seeder ingests old group messages to HydraDB
 2. Bot stores new group messages in HydraDB + SQLite
 3. On mention, bot recalls context from HydraDB
 4. Bot sends context + question to configured LLM and replies
+
+### Agent pipeline (new)
+1. Intent classifier (`question` / `action` / `help`)
+2. Query rewriter (Gemini structured output)
+3. Hydra multi-query retrieval (`fullRecall` + `recallPreferences`)
+4. Rerank + extraction (issues/action items/entities/dates)
+5. Final response with evidence lines
+6. Optional safe action proposal + `/confirm yes`
+
+If agent stages fail, bot falls back to single-pass retrieve + answer.
+
+## New functionality added
+
+- Stateful chat memory via grammY session per chat/user
+- Richer Hydra metadata at ingest (`author`, `timestamp`, `message_type`, `group_id`, `reply_to`, etc.)
+- Conversation-state memory ingest using `user_assistant_pairs` + `infer=true`
+- Multi-query retrieval diagnostics with broader recall
+- Structured extraction fields:
+  - issues
+  - action_items
+  - entities
+  - dates
+- Action proposal via Gemini function-calling + allowlist execution
+- Output sanitizer to remove markdown formatting markers before Telegram reply
 
 ## Prerequisites
 
@@ -53,6 +79,7 @@ Required:
 
 Important optional:
 - `BOT_DEBUG=1` verbose runtime logs
+- `AGENT_PIPELINE_ENABLED=1` enable 2-stage agent path
 - `SEED_MESSAGE_LIMIT=5000` per group seed cap
 - `SEED_TARGET_GROUP_ID=` seed only one group id
 - `SEED_TARGET_GROUP_NAME=` seed only one exact group title (lowercase compare)
@@ -60,10 +87,35 @@ Important optional:
 - `HYDRA_RECALL_SCOPE=group|global|group_plus_global`
 - `GLOBAL_SUB_TENANT_ID=global-knowledge`
 - `HYDRA_MAX_RECALL_RESULTS=25`
+- `HYDRA_RECALL_BREADTH_RESULTS=40`
+- `HYDRA_USE_METADATA_FILTERS=0`
 - `HYDRA_VERIFY_PROCESSING_ON_SEED=1`
 - `HYDRA_VERIFY_POLL_INTERVAL_MS=3000`
 - `HYDRA_VERIFY_MAX_WAIT_MS=300000`
+- `AGENT_GEMINI_MODEL=gemini-2.5-flash`
 - `PORT=3000`
+
+## Scope strategy (important)
+
+Isolated per-group memory:
+```env
+HYDRA_WRITE_SCOPE=group
+HYDRA_RECALL_SCOPE=group
+```
+
+Global shared memory across groups:
+```env
+HYDRA_WRITE_SCOPE=global
+HYDRA_RECALL_SCOPE=global
+GLOBAL_SUB_TENANT_ID=global-knowledge
+```
+
+Best balance (group-first + global fallback):
+```env
+HYDRA_WRITE_SCOPE=group
+HYDRA_RECALL_SCOPE=group_plus_global
+GLOBAL_SUB_TENANT_ID=global-knowledge
+```
 
 ## How to retrieve each API key/token
 
@@ -148,6 +200,7 @@ npm run bot
 
 Expected output (examples):
 - `[bot] Hydra scopes: write=..., recall=..., global=...`
+- `[bot] Agent pipeline enabled: yes|no`
 - `[seed] ...` (auto-seed runs at startup)
 - `[bot] Starting long polling as @your_bot`
 
@@ -159,31 +212,17 @@ List groups first:
 npm run seed:list-groups
 ```
 
-Expected output:
-- `[seed:list-groups] Found N groups/supergroups`
-- `- Group Name | -1001234567890`
-
 Dry run:
 
 ```bash
 npm run seed:dry
 ```
 
-Expected output:
-- `[seed] Starting dry-run history seeding.`
-- `[seed] Dry-run mode enabled. .seeded flag not written.`
-
 Real seed:
 
 ```bash
 npm run seed
 ```
-
-Expected output:
-- `[seed] Starting history seeding.`
-- `[seed] Verifying Hydra processing for "..." ...`
-- `[seed] Wrote seeded flag: .../.seeded`
-- `[seed] Done. groups=..., scanned=..., saved=..., skipped=...`
 
 Force reseed:
 
@@ -205,11 +244,6 @@ npm run dashboard
 
 Open: `http://localhost:3000`
 
-Expected:
-- Stats cards: total messages, groups, bot replies, uptime
-- Group tabs + search box
-- Last 50 logs (global or selected group)
-
 ### Phase checks
 
 ```bash
@@ -217,21 +251,13 @@ npm run phase1:test
 npm run phase2:test
 ```
 
-Expected `phase1:test`:
-- `[phase1] SQLite stats: ...`
-- Hydra check skipped unless `PHASE1_HYDRA_TEST=1`
-
-Enable Hydra part:
+Enable Hydra in phase1:
 
 ```bash
 PHASE1_HYDRA_TEST=1 npm run phase1:test
 ```
 
-Expected `phase2:test`:
-- `[phase2] Provider: ...`
-- `[phase2] Model response:`
-
-Override test prompt/context:
+Override phase2 prompt/context:
 
 ```bash
 PHASE2_CONTEXT="Alice: release Friday" PHASE2_QUESTION="When is release?" npm run phase2:test
@@ -250,8 +276,37 @@ npm run lint
 npm test
 ```
 
-Current behavior:
-- Placeholder echo commands (lint/tests not configured yet)
+## Telegram usage (new commands)
+
+Mention usage:
+- `@your_bot what did we decide about deployment?`
+- `@your_bot list issues and action items from recent discussion`
+- `@your_bot pin the latest summary`
+
+Slash commands:
+- `/help` or `/examples`
+- `/issues` -> last extracted issues
+- `/actions` -> last extracted action items
+- `/status` -> provider/pipeline/scope/pending action
+- `/followup <question>` -> multi-turn follow-up
+- `/confirm yes` -> confirm pending safe action
+
+## Safe action execution
+
+Allowlisted actions currently supported:
+- `summarize_thread`
+- `pin_summary` (requires bot permission)
+- `schedule_reminder` (preview message; no scheduler integration yet)
+- `moderation_action` (preview/safe-mode response)
+
+Actions are not auto-executed. User confirmation is required via `/confirm yes`.
+
+## Output formatting behavior
+
+Bot replies are normalized to plain Telegram text:
+- strips markdown fences and markers (`**`, `*`, backticks, headings)
+- keeps readable bullet points and evidence lines
+- avoids raw formatting artifacts in final messages
 
 ## Debug modes
 
@@ -263,14 +318,13 @@ BOT_DEBUG=1
 ```
 
 Adds logs such as:
-- `[bot:debug] incoming group=...`
-- `[bot:debug] mention_detected=...`
-- `[bot:debug] question="..."`
-- `[bot:debug] context_len_before_llm=...`
-- `[bot:debug] answer_len=...`
-- `[bot:debug] reply_sent group=...`
+- incoming message metadata
+- mention detection
+- pipeline stage signals
+- recall chunk counts
+- reply sent / fallback events
 
-### Seed verification debug-ish controls
+### Seed verification controls
 Set:
 
 ```env
@@ -284,33 +338,29 @@ This waits until seeded source IDs are ready/failed in Hydra before finishing gr
 ## Expected input/output examples
 
 ### Example 1: Mention question
-Input message:
+Input:
 - `@your_bot what did we decide for deployment?`
 
-Expected behavior:
-- Bot stores message
-- Bot recalls related context from Hydra
-- Bot replies in group with contextual answer
+Expected:
+- contextual answer
+- evidence footer lines with source IDs/scores
+- SQLite row with `is_bot_reply=1`
 
-Expected output type:
-- One Telegram text reply
-- One SQLite row with `is_bot_reply=1`
-
-### Example 2: Help / capability
+### Example 2: Structured extraction
 Input:
-- `/help`
-- `/examples`
-- `@your_bot what can you do?`
+- `@your_bot extract issues and action items from latest task messages`
+- then `/issues` or `/actions`
 
-Expected output:
-- Capability/help response from `bot/capabilities.js`
+Expected:
+- extracted lists in clean text
 
-### Example 3: No/low context
+### Example 3: Action confirmation
 Input:
-- Mentioned question before meaningful seed/index
+- `@your_bot pin the latest summary`
+- `/confirm yes`
 
-Expected output:
-- Reply may be generic or low-confidence until context exists
+Expected:
+- action preview/proposal then confirmed action response
 
 ## Common issues
 
@@ -333,6 +383,10 @@ Expected output:
 - Start bot once so SQLite file is created
 - Check `SQLITE_DB_PATH`
 
+6. `phase2:test` fails with `fetch failed`
+- Check internet access / firewall
+- Verify `GEMINI_API_KEY` and provider/model settings
+
 ## Recommended first run
 
 1. Configure `.env`
@@ -344,4 +398,5 @@ Expected output:
 7. Run `npm run bot`
 8. Mention bot in Telegram group
 9. Run `npm run dashboard`
+10. Validate new commands: `/status`, `/issues`, `/actions`, `/followup ...`
 

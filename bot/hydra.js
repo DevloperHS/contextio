@@ -30,6 +30,18 @@ function getMaxRecallResults() {
   return Math.max(5, Math.min(parsed, 100));
 }
 
+function getRecallBreadthResults() {
+  const raw = process.env.HYDRA_RECALL_BREADTH_RESULTS;
+  if (!raw) return 40;
+  const parsed = Number.parseInt(raw, 10);
+  if (Number.isNaN(parsed)) return 40;
+  return Math.max(10, Math.min(parsed, 200));
+}
+
+function shouldUseMetadataFilters() {
+  return String(process.env.HYDRA_USE_METADATA_FILTERS || "0") === "1";
+}
+
 function resolveWriteSubTenant(groupId) {
   const scope = String(process.env.HYDRA_WRITE_SCOPE || "group").trim().toLowerCase();
   if (scope === "global") {
@@ -104,6 +116,13 @@ function getHydraClient() {
   return client;
 }
 
+function unwrapHydraResponse(response) {
+  if (response && typeof response === "object" && response.data && typeof response.data === "object") {
+    return response.data;
+  }
+  return response || {};
+}
+
 async function withRetry(operation, attempts = 3) {
   let lastError;
 
@@ -122,6 +141,21 @@ async function withRetry(operation, attempts = 3) {
   throw lastError;
 }
 
+function buildMessageMetadata(groupId, author, options = {}) {
+  const nowIso = options.timestamp ? String(options.timestamp) : new Date().toISOString();
+  return {
+    author: String(author || "unknown"),
+    timestamp: nowIso,
+    message_type: String(options.messageType || "chat"),
+    topic: options.topic ? String(options.topic) : "",
+    reply_to: options.replyTo ? String(options.replyTo) : "",
+    group_id: String(groupId),
+    group_name: options.groupName ? String(options.groupName) : "",
+    telegram_message_id: options.messageId !== undefined ? String(options.messageId) : "",
+    seeded: Boolean(options.seeded),
+  };
+}
+
 async function saveMessage(groupId, author, text, options = {}) {
   if (!text || !String(text).trim()) {
     return { skipped: true, reason: "empty_text" };
@@ -134,17 +168,13 @@ async function saveMessage(groupId, author, text, options = {}) {
   const cleanText = String(text);
   const requestedSourceId = options?.sourceId ? String(options.sourceId) : undefined;
   const title = options?.title ? String(options.title) : undefined;
-  const metadata = JSON.stringify({
-    author: cleanAuthor,
-    timestamp: new Date().toISOString(),
-    seeded: Boolean(options?.seeded),
-  });
+  const metadata = JSON.stringify(buildMessageMetadata(groupId, cleanAuthor, options));
 
   debugLog(
     `saveMessage(group=${groupId}, write_sub_tenant=${subTenantId}, author=${cleanAuthor}, text_len=${cleanText.length})`
   );
 
-  const result = await withRetry(() => hydra.upload.addMemory({
+  const rawResult = await withRetry(() => hydra.upload.addMemory({
     memories: [
       {
         source_id: requestedSourceId,
@@ -159,12 +189,57 @@ async function saveMessage(groupId, author, text, options = {}) {
     upsert: true,
   }));
 
+  const result = unwrapHydraResponse(rawResult);
   const firstItem = Array.isArray(result?.results) ? result.results[0] : undefined;
   const queuedStatus = firstItem?.status || "unknown";
   const resultSourceId = firstItem?.source_id || "n/a";
   debugLog(
     `saveMessage success(write_sub_tenant=${subTenantId}, source_id=${resultSourceId}, status=${queuedStatus})`
   );
+  return result;
+}
+
+async function saveConversationState(groupId, userName, userMessage, assistantMessage, options = {}) {
+  const cleanUserMessage = String(userMessage || "").trim();
+  const cleanAssistantMessage = String(assistantMessage || "").trim();
+  if (!cleanUserMessage || !cleanAssistantMessage) {
+    return { skipped: true, reason: "empty_conversation_pair" };
+  }
+
+  const hydra = getHydraClient();
+  const tenantId = process.env.HYDRA_TENANT_ID;
+  const subTenantId = resolveWriteSubTenant(groupId);
+  const metadata = JSON.stringify(buildMessageMetadata(groupId, userName, {
+    ...options,
+    messageType: "user_assistant_pair",
+  }));
+
+  const rawResult = await withRetry(() => hydra.upload.addMemory({
+    memories: [
+      {
+        title: options?.title ? String(options.title) : "Conversation state",
+        user_name: String(userName || "user"),
+        user_assistant_pairs: [
+          {
+            user: cleanUserMessage,
+            assistant: cleanAssistantMessage,
+          },
+        ],
+        infer: true,
+        document_metadata: metadata,
+      },
+    ],
+    tenant_id: tenantId,
+    sub_tenant_id: subTenantId,
+    upsert: true,
+  }));
+
+  const result = unwrapHydraResponse(rawResult);
+  const firstItem = Array.isArray(result?.results) ? result.results[0] : undefined;
+  debugLog(
+    `saveConversationState success(sub_tenant=${subTenantId}, source_id=${firstItem?.source_id || "n/a"}, status=${firstItem?.status || "unknown"})`
+  );
+
   return result;
 }
 
@@ -215,57 +290,160 @@ function mergeUniqueContexts(contexts) {
   return merged.join("\n");
 }
 
-async function recallContext(groupId, question) {
+function parseObjectMaybe(value) {
+  if (!value) return {};
+  if (typeof value === "object") return value;
+  if (typeof value !== "string") return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch (_error) {
+    return {};
+  }
+}
+
+function normalizeChunk(chunk, meta) {
+  const documentMeta = parseObjectMaybe(chunk?.document_metadata);
+  return {
+    key: `${chunk?.chunk_uuid || ""}:${chunk?.source_id || ""}`,
+    chunk_uuid: String(chunk?.chunk_uuid || ""),
+    source_id: String(chunk?.source_id || ""),
+    content: String(chunk?.chunk_content || "").trim(),
+    score: Number(chunk?.relevancy_score || 0),
+    source_title: String(chunk?.source_title || ""),
+    source_upload_time: String(chunk?.source_upload_time || ""),
+    source_last_updated_time: String(chunk?.source_last_updated_time || ""),
+    source_type: String(chunk?.source_type || ""),
+    document_metadata: documentMeta,
+    recall_kind: meta.recallKind,
+    recall_query: meta.query,
+    sub_tenant_id: meta.subTenantId,
+  };
+}
+
+async function runRecallWithFilterFallback(hydra, methodName, payload) {
+  try {
+    const response = await withRetry(() => hydra.recall[methodName](payload));
+    return unwrapHydraResponse(response);
+  } catch (error) {
+    if (!payload.metadata_filters) {
+      throw error;
+    }
+    debugLog(`${methodName} failed with metadata_filters, retrying without filters`);
+    const safePayload = { ...payload };
+    delete safePayload.metadata_filters;
+    const response = await withRetry(() => hydra.recall[methodName](safePayload));
+    return unwrapHydraResponse(response);
+  }
+}
+
+function buildDefaultMetadataFilters(groupId, options = {}) {
+  if (!shouldUseMetadataFilters()) return undefined;
+  const custom = options?.metadataFilters;
+  if (custom && typeof custom === "object") return custom;
+  return { group_id: String(groupId) };
+}
+
+async function recallWithDiagnostics(groupId, question, options = {}) {
   const hydra = getHydraClient();
   const tenantId = process.env.HYDRA_TENANT_ID;
-  const query = String(question || "");
-  const maxResults = getMaxRecallResults();
+  const query = String(question || "").trim();
+  const rewrittenQuery = String(options.rewrittenQuery || "").trim();
+  const maxResults = options.maxResults || getRecallBreadthResults();
   const subTenants = resolveRecallSubTenants(groupId);
-  const contexts = [];
+  const metadataFilters = buildDefaultMetadataFilters(groupId, options);
+  const queries = Array.from(new Set([query, rewrittenQuery].filter(Boolean)));
+  const rawContexts = [];
+  const allChunks = [];
+
   debugLog(
-    `recallContext(group=${groupId}, recall_sub_tenants=${subTenants.join(",")}, query_len=${query.length}, max_results=${maxResults})`
+    `recallWithDiagnostics(group=${groupId}, sub_tenants=${subTenants.join(",")}, queries=${queries.length}, max_results=${maxResults})`
   );
 
   for (const subTenantId of subTenants) {
-    const result = await withRetry(() => hydra.recall.fullRecall({
-      tenant_id: tenantId,
-      sub_tenant_id: subTenantId,
-      query,
-      alpha: 0.7,
-      recency_bias: 0.3,
-      max_results: maxResults,
-    }));
+    for (const q of queries) {
+      const basePayload = {
+        tenant_id: tenantId,
+        sub_tenant_id: subTenantId,
+        query: q,
+        alpha: 0.7,
+        recency_bias: 0.3,
+        max_results: maxResults,
+        mode: "thinking",
+        additional_context: String(options.additionalContext || ""),
+      };
+      if (metadataFilters) {
+        basePayload.metadata_filters = metadataFilters;
+      }
 
-    const primaryContext = normalizeRecallContext(result);
-    const chunkCount = extractChunkCount(result);
-    debugLog(
-      `recallContext sub_tenant=${subTenantId}, chunks=${chunkCount}, context_len=${primaryContext.length}`
-    );
-    if (primaryContext) {
-      contexts.push(primaryContext);
-    }
+      const sourceResult = await runRecallWithFilterFallback(hydra, "fullRecall", basePayload);
+      rawContexts.push(normalizeRecallContext(sourceResult));
+      const sourceChunks = Array.isArray(sourceResult?.chunks)
+        ? sourceResult.chunks.map((chunk) => normalizeChunk(chunk, {
+            recallKind: "fullRecall",
+            query: q,
+            subTenantId,
+          }))
+        : [];
+      allChunks.push(...sourceChunks);
+      debugLog(`fullRecall sub_tenant=${subTenantId}, query_len=${q.length}, chunks=${sourceChunks.length}`);
 
-    const memoryResult = await withRetry(() => hydra.recall.recallPreferences({
-      tenant_id: tenantId,
-      sub_tenant_id: subTenantId,
-      query,
-      alpha: 0.7,
-      recency_bias: 0.3,
-      max_results: maxResults,
-    }));
-    const memoryContext = normalizeRecallContext(memoryResult);
-    const memoryChunkCount = extractChunkCount(memoryResult);
-    debugLog(
-      `recallPreferences sub_tenant=${subTenantId}, chunks=${memoryChunkCount}, context_len=${memoryContext.length}`
-    );
-    if (memoryContext) {
-      contexts.push(memoryContext);
+      const prefsResult = await runRecallWithFilterFallback(hydra, "recallPreferences", basePayload);
+      rawContexts.push(normalizeRecallContext(prefsResult));
+      const prefsChunks = Array.isArray(prefsResult?.chunks)
+        ? prefsResult.chunks.map((chunk) => normalizeChunk(chunk, {
+            recallKind: "recallPreferences",
+            query: q,
+            subTenantId,
+          }))
+        : [];
+      allChunks.push(...prefsChunks);
+      debugLog(`recallPreferences sub_tenant=${subTenantId}, query_len=${q.length}, chunks=${prefsChunks.length}`);
     }
   }
 
-  const merged = mergeUniqueContexts(contexts);
-  debugLog(`recallContext merged_context_len=${merged.length}`);
-  return merged;
+  const dedupMap = new Map();
+  for (const chunk of allChunks) {
+    if (!chunk.content) continue;
+    const key = chunk.chunk_uuid || `${chunk.source_id}:${chunk.content}`;
+    const existing = dedupMap.get(key);
+    if (!existing || chunk.score > existing.score) {
+      dedupMap.set(key, chunk);
+    }
+  }
+
+  const dedupedChunks = Array.from(dedupMap.values()).sort((a, b) => b.score - a.score);
+  const topCount = getMaxRecallResults();
+  const topChunks = dedupedChunks.slice(0, topCount);
+  const context = topChunks.map((chunk) => chunk.content).join("\n");
+  const fallbackContext = mergeUniqueContexts(rawContexts);
+
+  const evidences = topChunks.map((chunk, index) => ({
+    rank: index + 1,
+    source_id: chunk.source_id,
+    source_title: chunk.source_title,
+    score: chunk.score,
+    sub_tenant_id: chunk.sub_tenant_id,
+    recall_kind: chunk.recall_kind,
+    recall_query: chunk.recall_query,
+    snippet: chunk.content.slice(0, 280),
+    author: String(chunk.document_metadata?.author || ""),
+    timestamp: String(chunk.document_metadata?.timestamp || chunk.source_upload_time || ""),
+  }));
+
+  return {
+    context: context || fallbackContext,
+    evidences,
+    chunks: dedupedChunks,
+    total_chunks: dedupedChunks.length,
+    metadata_filters_used: metadataFilters || null,
+  };
+}
+
+async function recallContext(groupId, question) {
+  const result = await recallWithDiagnostics(groupId, question);
+  debugLog(`recallContext merged_context_len=${result.context.length}`);
+  return result.context;
 }
 
 async function waitForProcessingReady(groupId, sourceIds) {
@@ -313,11 +491,12 @@ async function waitForProcessingReady(groupId, sourceIds) {
     const batches = chunkArray(pendingList, 100);
 
     for (const batch of batches) {
-      const verify = await withRetry(() => hydra.upload.verifyProcessing({
+      const rawVerify = await withRetry(() => hydra.upload.verifyProcessing({
         tenant_id: tenantId,
         sub_tenant_id: subTenantId,
         file_ids: batch,
       }));
+      const verify = unwrapHydraResponse(rawVerify);
 
       const statuses = Array.isArray(verify?.statuses) ? verify.statuses : [];
       for (const statusInfo of statuses) {
@@ -354,7 +533,9 @@ async function waitForProcessingReady(groupId, sourceIds) {
 
 module.exports = {
   saveMessage,
+  saveConversationState,
   recallContext,
+  recallWithDiagnostics,
   extractSourceIdsFromAddMemory,
   waitForProcessingReady,
 };
