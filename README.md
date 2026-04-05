@@ -1,5 +1,8 @@
 # contextio
 
+<img width="1254" height="1254" alt="Contextio_ AI-powered message assistant" src="https://github.com/user-attachments/assets/f69c015c-7cbc-4744-8017-a114ec701e4b" />
+
+
 Contextio is a multi-tenant memory layer for group conversations-turning every Telegram group into its own intelligent knowledge tenant. It auto-seeds historical chats, logs real-time messages, and builds a structured, queryable context layer per group tenant.
 
 Powered by Hydra retrieval and LLM agents, Contextio doesn’t just answer questions-it understands intent, rewrites queries, performs multi-step retrieval, reranks signals, and returns precise, evidence-backed insights.
