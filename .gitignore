@@ -27,3 +27,6 @@ build/
 # local tool state
 .agents
 skills-lock.json
+Telegram-Bot-PRD.md
+WhatsApp-Bot-PRD.md
+data.md
